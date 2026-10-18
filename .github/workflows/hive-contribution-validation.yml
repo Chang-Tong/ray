@@ -1,0 +1,65 @@
+name: HiveServer2 contribution validation
+on:
+  push:
+    branches: [validation/hive-integration-ci]
+permissions:
+  contents: read
+jobs:
+  hive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install test environment
+        run: |
+          python -m venv /tmp/hive-venv
+          echo /tmp/hive-venv/bin >> "$GITHUB_PATH"
+          /tmp/hive-venv/bin/pip install 'ray[data] @ https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp310-cp310-manylinux2014_x86_64.whl' impyla==0.23.0 pytest pytest-timeout pytest-asyncio
+      - name: Use the contribution's Python sources
+        run: python python/ray/setup-dev.py --yes --allow data tests
+      - name: Adapt the CI-only runner to this host
+        run: |
+          echo "REAL_DOCKER=$(command -v docker)" >> "$GITHUB_ENV"
+          mkdir /tmp/hive-bin
+          cat > /tmp/hive-bin/docker <<'PY'
+          #!/usr/bin/env python
+          import os
+          import sys
+          args = sys.argv[1:]
+          if args[:1] == ['run']:
+              args[1:1] = ['-p', '127.0.0.1::10000']
+          os.execv(os.environ['REAL_DOCKER'], ['docker', *args])
+          PY
+          cat > /tmp/hive-bin/bazel <<'PY'
+          #!/usr/bin/env python
+          import os
+          import subprocess
+          import sys
+          args = sys.argv[1:]
+          for i, arg in enumerate(args):
+              if arg == '--test-env':
+                  key, value = args[i + 1].split('=', 1)
+                  os.environ[key] = value
+          service = 'ray-hive-' + os.environ['BUILDKITE_JOB_ID']
+          port = subprocess.check_output([os.environ['REAL_DOCKER'], 'port', service, '10000/tcp'], text=True).strip().rsplit(':', 1)[1]
+          os.environ['RAY_HIVE_TEST_HOST'] = '127.0.0.1'
+          os.environ['RAY_HIVE_TEST_PORT'] = port
+          print('Running real-server tests with source Ray Data and nightly Core', flush=True)
+          os.execv(sys.executable, [sys.executable, '-m', 'pytest', '-v', '-rs', 'python/ray/data/tests/datasource/test_hive_integration.py'])
+          PY
+          chmod +x /tmp/hive-bin/docker /tmp/hive-bin/bazel
+          echo /tmp/hive-bin >> "$GITHUB_PATH"
+      - name: Run disposable HiveServer2 and integration suite
+        env:
+          BUILDKITE_JOB_ID: github-validation-${{ github.run_id }}
+          RAY_HIVE_LOG_DIR: /tmp/hive-logs
+        run: bash ci/ray_ci/data/run_hive_integration.sh
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hive-server-logs
+          path: /tmp/hive-logs
